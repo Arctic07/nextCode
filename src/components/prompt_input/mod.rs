@@ -1637,6 +1637,7 @@ pub fn PromptInput<'a>(
     let typeahead_count = typeahead.suggestions.len() as i32;
     let mut typeahead_selected = typeahead.selected;
     let typeahead_selection_reset = typeahead.selection_reset;
+    let typeahead_selection_user_moved = typeahead.selection_user_moved;
     let typeahead_suggestions = Arc::clone(&typeahead.suggestions);
     let typeahead_kind = typeahead.kind;
     let typeahead_file_token = typeahead.file_token.clone();
@@ -1726,6 +1727,8 @@ pub fn PromptInput<'a>(
                         debug_assert!(false, "handleTab never submits");
                     }
                 }
+                let mut selection_user_moved = typeahead_selection_user_moved;
+                selection_user_moved.set(false);
                 typeahead_selected.set(0);
             }
             true
@@ -1739,6 +1742,8 @@ pub fn PromptInput<'a>(
         move || prompt_actions_active && has_suggestions,
         move || {
             let selected = typeahead_selected.get();
+            let mut selection_user_moved = typeahead_selection_user_moved;
+            selection_user_moved.set(true);
             typeahead_selected.set(crate::hooks::use_typeahead::handle_autocomplete_previous(
                 selected,
                 typeahead_count,
@@ -1754,6 +1759,8 @@ pub fn PromptInput<'a>(
         move || prompt_actions_active && has_suggestions,
         move || {
             let selected = typeahead_selected.get();
+            let mut selection_user_moved = typeahead_selection_user_moved;
+            selection_user_moved.set(true);
             typeahead_selected.set(crate::hooks::use_typeahead::handle_autocomplete_next(
                 selected,
                 typeahead_count,
@@ -1773,6 +1780,8 @@ pub fn PromptInput<'a>(
             // synchronous producers stay quiet until it changes.
             typeahead_dismiss.handle_autocomplete_dismiss();
             autocomplete_dismissed_input.set(Some(input.read().clone()));
+            let mut selection_user_moved = typeahead_selection_user_moved;
+            selection_user_moved.set(false);
             true
         },
     );
@@ -1827,6 +1836,7 @@ pub fn PromptInput<'a>(
     let suggestions_for_events = Arc::clone(&typeahead_suggestions);
     let file_token_for_events = typeahead_file_token.clone();
     let typeahead_kind_for_events = typeahead_kind;
+    let mut selection_user_moved_for_events = typeahead_selection_user_moved;
     let inline_ghost_text_for_events = typeahead_inline_ghost_text.clone();
     let commands_for_events = Arc::clone(&commands);
     let mut autocomplete_dismissed_input_for_events = autocomplete_dismissed_input;
@@ -1930,6 +1940,7 @@ pub fn PromptInput<'a>(
                     Some(crate::hooks::use_typeahead::KeyDownEffect::SetSelectedSuggestion(
                         selected,
                     )) => {
+                        selection_user_moved_for_events.set(true);
                         typeahead_selected.set(selected);
                         event.stop_propagation();
                         return;
@@ -1942,6 +1953,7 @@ pub fn PromptInput<'a>(
                                 dismiss,
                                 submit_action,
                             }) => {
+                                selection_user_moved_for_events.set(false);
                                 cursor_offset.set(offset);
                                 input.set(value.clone());
                                 if dismiss {
@@ -1968,6 +1980,7 @@ pub fn PromptInput<'a>(
                             ) => {
                                 autocomplete_dismissed_input_for_events
                                     .set(Some(current_input.clone()));
+                                selection_user_moved_for_events.set(false);
                                 typeahead_selected.set(0);
                             }
                             None => {}
@@ -1993,6 +2006,7 @@ pub fn PromptInput<'a>(
                                 dismiss,
                                 submit_action,
                             }) => {
+                                selection_user_moved_for_events.set(false);
                                 cursor_offset.set(offset);
                                 input.set(value.clone());
                                 if dismiss {
@@ -2006,6 +2020,7 @@ pub fn PromptInput<'a>(
                             ) => {
                                 autocomplete_dismissed_input_for_events
                                     .set(Some(current_input.clone()));
+                                selection_user_moved_for_events.set(false);
                                 typeahead_selected.set(0);
                             }
                             Some(
@@ -2021,6 +2036,7 @@ pub fn PromptInput<'a>(
                     // `autocomplete:previous` / `autocomplete:next` fallbacks.
                     KeyCode::Up if has_suggestions => {
                         let sel = typeahead_selected.get();
+                        selection_user_moved_for_events.set(true);
                         typeahead_selected.set(
                             crate::hooks::use_typeahead::handle_autocomplete_previous(
                                 sel,
@@ -2031,6 +2047,7 @@ pub fn PromptInput<'a>(
                     }
                     KeyCode::Down if has_suggestions => {
                         let sel = typeahead_selected.get();
+                        selection_user_moved_for_events.set(true);
                         typeahead_selected.set(
                             crate::hooks::use_typeahead::handle_autocomplete_next(
                                 sel,
@@ -2218,6 +2235,18 @@ pub fn PromptInput<'a>(
         let selected_suggestion = typeahead_suggestions
             .get(typeahead_selected.get() as usize)
             .cloned();
+        // An automatic top-row selection must not redirect Enter: a slow
+        // recompute can still hold the previous query's row (`/init` while the
+        // input spells `/new`). Only an explicit arrow-key choice outranks the
+        // typed command.
+        let typed_command = (!typeahead_selection_user_moved.get())
+            .then(|| {
+                crate::utils::suggestions::command_suggestions::typed_command_submission(
+                    &input.read(),
+                    commands.as_slice(),
+                )
+            })
+            .flatten();
         let command_application = selected_suggestion.as_ref().and_then(|item| {
             crate::utils::suggestions::command_suggestions::apply_command_suggestion(
                 item,
@@ -2225,27 +2254,32 @@ pub fn PromptInput<'a>(
                 commands.as_slice(),
             )
         });
-        let text = command_application
-            .as_ref()
-            .map(|application| application.input.clone())
-            .or_else(|| {
-                selected_suggestion
-                    .as_ref()
-                    .map(|item| item.command_text.clone())
-            })
-            .unwrap_or_else(|| input.to_string());
-        let requires_arguments = command_application
-            .as_ref()
-            .is_some_and(|application| !application.should_submit)
-            || (command_application.is_none()
-                && selected_suggestion
-                    .as_ref()
-                    .is_some_and(|suggestion| {
-                        crate::utils::suggestions::command_suggestions::command_suggestion_requires_arguments(
-                            suggestion,
-                            commands.as_slice(),
-                        )
-                    }));
+        let (text, requires_arguments) = if let Some(typed) = typed_command {
+            (typed.input, typed.requires_arguments)
+        } else {
+            let text = command_application
+                .as_ref()
+                .map(|application| application.input.clone())
+                .or_else(|| {
+                    selected_suggestion
+                        .as_ref()
+                        .map(|item| item.command_text.clone())
+                })
+                .unwrap_or_else(|| input.to_string());
+            let requires_arguments = command_application
+                .as_ref()
+                .is_some_and(|application| !application.should_submit)
+                || (command_application.is_none()
+                    && selected_suggestion
+                        .as_ref()
+                        .is_some_and(|suggestion| {
+                            crate::utils::suggestions::command_suggestions::command_suggestion_requires_arguments(
+                                suggestion,
+                                commands.as_slice(),
+                            )
+                        }));
+            (text, requires_arguments)
+        };
         if requires_arguments {
             let text = format!("{} ", text.trim_end());
             cursor_offset.set(text.len());
