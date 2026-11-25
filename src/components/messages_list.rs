@@ -27,6 +27,11 @@ use crate::types::message::{
     SearchResultMode, StructuredDiffHunk, SystemMessage, SystemMessageLevel, ToolResultStatus,
     ToolUseProgressMessage, ToolUseStatus,
 };
+
+/// Stable row id for the optimistic user row shown while `UserPromptSubmit`
+/// hooks run. It never enters history; once the submission settles, the
+/// canonical entry (same text, its own uuid) replaces it.
+pub(crate) const PENDING_USER_ROW_UUID: &str = "cometix-pending-user-submission";
 #[cfg(test)]
 use crate::types::message::{
     CollapsedReadSearchEntry, CollapsedReadSearchGroup, RelevantMemory, StopHookInfo,
@@ -1032,6 +1037,7 @@ fn is_non_skippable_after_collapsed_group(message: &RenderableMessage) -> bool {
 #[cfg(test)]
 thread_local! {
     static LOGO_HEADER_RENDER_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static MESSAGE_ROWS_UPDATE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -1042,6 +1048,16 @@ pub(crate) fn reset_logo_header_render_count() {
 #[cfg(test)]
 pub(crate) fn logo_header_render_count() -> usize {
     LOGO_HEADER_RENDER_COUNT.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_message_rows_update_count() {
+    MESSAGE_ROWS_UPDATE_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn message_rows_update_count() -> usize {
+    MESSAGE_ROWS_UPDATE_COUNT.with(std::cell::Cell::get)
 }
 
 /// Maps to: CC `components/Messages.tsx` `LogoHeader`.
@@ -1097,6 +1113,9 @@ struct MessagesImplProps {
     /// Maps to: CC `Messages.tsx:314-320,677-684` post-collapse export slice.
     pub render_range: Option<(usize, usize)>,
     pub messages: Arc<Vec<RenderableMessage>>,
+    /// Projection snapshot generation; part of the memo key so a freed-and-
+    /// reused Arc address can never alias an older row snapshot.
+    pub messages_revision: u64,
     /// Maps to: CC `Messages.tsx:262` `conversationId: string` — REPL-owned
     /// (`REPL.tsx:2017`), bumped on compact resets so `messageKey`
     /// (`Messages.tsx:792-795`, `${msg.uuid}-${conversationId}`) changes and
@@ -1133,6 +1152,9 @@ struct MessagesImplProps {
     /// it is rendered after formal rows and never participates in message
     /// normalization/grouping/lookups.
     pub streaming_text: Option<String>,
+    /// Accepted prompt text shown optimistically while `UserPromptSubmit`
+    /// hooks run (see `PENDING_USER_ROW_UUID`).
+    pub pending_user_message: Option<String>,
     /// Tool-use id currently being classifier-checked, matching official
     /// `useIsClassifierChecking(param.id)` as a pure display seam.
     pub classifier_checking_tool_use_id: Option<String>,
@@ -1182,6 +1204,9 @@ struct MessageRowsMemoKey {
     pub render_range: Option<(usize, usize)>,
     collapsed_ptr: usize,
     collapsed_len: usize,
+    /// Source projection generation; paired with `collapsed_ptr` so address
+    /// reuse cannot alias a different prepared snapshot.
+    source_revision: u64,
     conversation_id: u64,
     first_uuid: Option<String>,
     last_uuid: Option<String>,
@@ -1200,6 +1225,9 @@ struct MessageRowsMemoKey {
     /// past this boundary — see [`tool_use_id_set_memo_key`].
     in_progress_tool_use_ids: Vec<String>,
     streaming_tool_use_ids: Vec<String>,
+    /// Text accepted but still awaiting `UserPromptSubmit` hooks. Included so
+    /// a submit and its settlement each re-enter the row map.
+    pending_user_message: Option<String>,
     /// CC re-renders themed rows past `React.memo` when the ThemeProvider
     /// value changes; iocraft reads context only in an update, so the theme
     /// must get past this boundary itself.
@@ -1216,6 +1244,7 @@ struct MessageRowsMemoKey {
 #[allow(clippy::too_many_arguments)]
 fn message_rows_memo_key(
     prepared: &MessagesPreparedPipeline,
+    source_revision: u64,
     conversation_id: u64,
     is_loading: bool,
     verbose: bool,
@@ -1235,6 +1264,7 @@ fn message_rows_memo_key(
         tool_pool: tool_pool_memo_key(tools),
         collapsed_ptr: Arc::as_ptr(&prepared.collapsed) as usize,
         collapsed_len: prepared.collapsed.len(),
+        source_revision,
         conversation_id,
         first_uuid: prepared
             .collapsed
@@ -1257,6 +1287,7 @@ fn message_rows_memo_key(
         classifier_checking_is_auto,
         in_progress_tool_use_ids: tool_use_id_set_memo_key(in_progress_tool_use_ids),
         streaming_tool_use_ids: tool_use_id_set_memo_key(streaming_tool_use_ids),
+        pending_user_message: None,
         theme,
     }
 }
@@ -1266,6 +1297,8 @@ struct MessageRowsProps {
     /// Maps to: CC `Messages.tsx:314-320,677-684` post-collapse export slice.
     pub render_range: Option<(usize, usize)>,
     pub prepared: MessagesPreparedPipeline,
+    /// Source projection generation; see `MessagesImplProps`.
+    pub messages_revision: u64,
     /// Maps to: CC `Messages.tsx:262` `conversationId`, part of every row key
     /// (`Messages.tsx:792-795`).
     pub conversation_id: u64,
@@ -1285,6 +1318,11 @@ struct MessageRowsProps {
     pub streaming_tool_use_ids: Arc<HashSet<String>>,
     /// Maps to: CC `Messages.tsx:822` `tools={tools}` on each `MessageRow`.
     pub tools: Arc<Vec<crate::types::tools::Tool>>,
+    /// Accepted prompt text that has not reached history yet because the
+    /// `UserPromptSubmit` hooks are still running. Rendered after the formal
+    /// rows as a normal user row, then replaced by the real entry, so the
+    /// submit always has visible feedback.
+    pub pending_user_message: Option<String>,
     /// The resolved theme MessagesImpl rendered under, for the memo keys.
     pub theme: ThemeName,
 }
@@ -1313,9 +1351,12 @@ impl Component for MessageRows {
         _hooks: Hooks,
         updater: &mut ComponentUpdater,
     ) {
+        #[cfg(test)]
+        MESSAGE_ROWS_UPDATE_COUNT.with(|count| count.set(count.get() + 1));
         let profile_start = component_profile_enabled().then(Instant::now);
         let mut next_key = message_rows_memo_key(
             &props.prepared,
+            props.messages_revision,
             props.conversation_id,
             props.is_loading,
             props.verbose,
@@ -1333,16 +1374,17 @@ impl Component for MessageRows {
 
         next_key.render_range = props.render_range;
         next_key.can_animate = props.can_animate;
+        next_key.pending_user_message = props.pending_user_message.clone();
 
         // Match CC's Messages-level memo boundary for the native scrollback
         // path: ordinary PromptInput state changes do not change transcript
         // props, so the retained row subtree is reused without rebuilding rows
-        // or dirtying layout. While loading, keep entering rows so dynamic
-        // in-progress rows can be gated individually by MessageRow/OffscreenFreeze.
-        // A row's own AppState subscription still gets through (Contract D:
-        // a manual bailout checks `children_have_pending_change`).
-        if !props.is_loading
-            && self.last_key.as_ref() == Some(&next_key)
+        // or dirtying layout. Loading is not a reason to bypass this: a
+        // dynamic row's own animation/AppState hook reports a pending child
+        // change (Contract D), exactly the rows that must update. Rebuilding
+        // the whole sliced transcript on every spinner tick made long sessions
+        // pin a core while a query streamed.
+        if self.last_key.as_ref() == Some(&next_key)
             && !updater.children_have_pending_change()
         {
             if let Some(start) = profile_start {
@@ -1400,6 +1442,54 @@ impl Component for MessageRows {
         let tools = Arc::clone(&props.tools);
         let theme = props.theme;
         let rendered_count = end.saturating_sub(start);
+        let pending_is_continuation = end > start
+            && matches!(
+                messages.get(end - 1).map(|message| &message.kind),
+                Some(RenderableMessageKind::User { .. })
+            );
+        // Optimistic feedback for the accepted prompt: `UserPromptSubmit`
+        // hooks can take seconds, and the canonical entry only enters history
+        // after they settle. The row owns a one-message array so the formal
+        // slice keeps its identity and memo.
+        let pending_user_row = props
+            .pending_user_message
+            .clone()
+            .filter(|text| !text.trim().is_empty())
+            .map(|text| {
+                let pending_messages = Arc::new(vec![RenderableMessage::user(
+                    PENDING_USER_ROW_UUID,
+                    text.clone(),
+                )]);
+                element! {
+                    // No extra Memo wrapper: the parent rows/messages keys
+                    // already gate this element, and MessageRow's own static
+                    // key compares every layout-affecting prop (columns,
+                    // verbose, transcript/expand flags, theme). A comparator
+                    // that only carried the text would keep a stale wrap
+                    // width on resize or a stale margin when the formal tail
+                    // changes under identical pending text.
+                    MessageRow(
+                        messages: pending_messages,
+                        index: 0usize,
+                        conversation_id: conversation_id,
+                        add_margin: true,
+                        is_user_continuation: pending_is_continuation,
+                        has_content_after: false,
+                        can_animate: false,
+                        is_loading: false,
+                        lookups: Some(Arc::clone(&lookups)),
+                        verbose: verbose,
+                        is_transcript_mode: is_transcript_mode,
+                        expand_thinking: expand_thinking,
+                        expand_collapsed_read_search: expand_collapsed_read_search,
+                        columns: columns,
+                        in_progress_tool_use_ids: Arc::clone(&in_progress_tool_use_ids),
+                        streaming_tool_use_ids: Arc::clone(&streaming_tool_use_ids),
+                        tools: Arc::clone(&tools),
+                    )
+                }
+                .into_any()
+            });
 
         updater.update_children(
             (start..end).map(move |idx| {
@@ -1467,7 +1557,9 @@ impl Component for MessageRows {
                         )
                     }
                 }
-            }),
+                .into_any()
+            })
+            .chain(pending_user_row),
             None,
         );
         if let Some(start_time) = profile_start {
@@ -1509,6 +1601,7 @@ struct MessagesMemoKey {
     /// Maps to: CC `Messages.tsx:314-320,677-684` post-collapse export slice.
     pub render_range: Option<(usize, usize)>,
     messages: (usize, usize, Option<String>, Option<String>),
+    messages_revision: u64,
     /// CC: `conversationId` is a `MessagesImpl` prop, so `React.memo`'s
     /// default comparison covers it.
     conversation_id: u64,
@@ -1528,6 +1621,7 @@ struct MessagesMemoKey {
     classifier_checking_tool_use_id: Option<String>,
     classifier_checking_is_auto: bool,
     streaming_text: Option<String>,
+    pending_user_message: Option<String>,
     /// CC `Messages.tsx:1054-1068` — see [`tool_use_id_set_memo_key`].
     in_progress_tool_use_ids: Vec<String>,
     streaming_tool_use_ids: Vec<String>,
@@ -1567,9 +1661,10 @@ impl Component for MessagesImpl {
         // The fallback matched the AppState default, which is why it was
         // invisible. Made visible by the P7 flip to the strict read.
         let mut hooks = hooks.with_context_stack(updater.component_context_stack());
+        let messages = Arc::clone(&props.messages);
         let profile_start = component_profile_enabled().then(Instant::now);
         let prepare_start = component_profile_enabled().then(Instant::now);
-        let messages_key = messages_memo_key(&props.messages);
+        let messages_key = messages_memo_key(&messages);
         let keybinding_runtime = hooks
             .try_use_context::<crate::keybindings::keybinding_context::KeybindingRuntime>()
             .map(|runtime| runtime.clone());
@@ -1594,7 +1689,7 @@ impl Component for MessagesImpl {
         // this prepared pipeline, so Ctrl+E must rebuild it before grouping.
         let prepared = hooks.use_memo(
             || {
-                let normalized = normalize_messages(&props.messages);
+                let normalized = normalize_messages(&messages);
                 let compact_aware = compact_aware_messages(normalized.clone(), props.verbose);
                 let filtered =
                     filter_non_rendering_messages(compact_aware, props.is_transcript_mode);
@@ -1647,6 +1742,7 @@ impl Component for MessagesImpl {
             // it (CC `Messages.tsx:579-584`).
             (
                 messages_key.clone(),
+                props.messages_revision,
                 props.is_transcript_mode,
                 props.show_all_in_transcript,
                 props.verbose,
@@ -1668,6 +1764,7 @@ impl Component for MessagesImpl {
         let next_key = MessagesMemoKey {
             render_range: props.render_range,
             messages: messages_key,
+            messages_revision: props.messages_revision,
             conversation_id: props.conversation_id,
             is_loading: props.is_loading,
             verbose: props.verbose,
@@ -1685,6 +1782,7 @@ impl Component for MessagesImpl {
             classifier_checking_tool_use_id: props.classifier_checking_tool_use_id.clone(),
             classifier_checking_is_auto: props.classifier_checking_is_auto,
             streaming_text: props.streaming_text.clone(),
+            pending_user_message: props.pending_user_message.clone(),
             in_progress_tool_use_ids: tool_use_id_set_memo_key(&props.in_progress_tool_use_ids),
             streaming_tool_use_ids: tool_use_id_set_memo_key(&props.streaming_tool_use_ids),
             tool_pool: tool_pool_memo_key(&props.tools),
@@ -1696,8 +1794,9 @@ impl Component for MessagesImpl {
         // except that a descendant's own AppState subscription still gets
         // through, as React re-renders a subscriber past a memoized ancestor
         // (Contract D: a manual bailout checks `children_have_pending_change`).
-        if !props.is_loading
-            && self.last_key.as_ref() == Some(&next_key)
+        // The same holds while loading: the spinner is a REPL sibling, so a
+        // steady `is_loading` must not re-enter the whole transcript every tick.
+        if self.last_key.as_ref() == Some(&next_key)
             && !updater.children_have_pending_change()
         {
             if let Some(start) = profile_start {
@@ -1707,7 +1806,7 @@ impl Component for MessagesImpl {
                         "cometix-component name=Messages action=retain elapsed={:?} prepare={:?} messages_len={} collapsed_len={} is_loading={} streaming_len={} columns={}",
                         elapsed,
                         prepare_elapsed.unwrap_or_default(),
-                        props.messages.len(),
+                        messages.len(),
                         prepared.collapsed.len(),
                         props.is_loading,
                         props.streaming_text.as_ref().map_or(0, String::len),
@@ -1806,6 +1905,7 @@ impl Component for MessagesImpl {
         );
         let mut rows_key = message_rows_memo_key(
             &prepared,
+            props.messages_revision,
             props.conversation_id,
             props.is_loading,
             props.verbose,
@@ -1829,6 +1929,7 @@ impl Component for MessagesImpl {
                         MessageRows(
                             render_range: props.render_range,
                             prepared: prepared.clone(),
+                            messages_revision: props.messages_revision,
                             conversation_id: props.conversation_id,
                             is_loading: props.is_loading,
                             verbose: props.verbose,
@@ -1844,6 +1945,7 @@ impl Component for MessagesImpl {
                             // CC `Messages.tsx:822` `tools={tools}` — the row
                             // map is this component in the port's L1 split.
                             tools: Arc::clone(&props.tools),
+                            pending_user_message: props.pending_user_message.clone(),
                             theme: theme_name,
                         )
                     }
@@ -1884,7 +1986,7 @@ impl Component for MessagesImpl {
                     elapsed,
                     prepare_elapsed.unwrap_or_default(),
                     child_count,
-                    props.messages.len(),
+                    messages.len(),
                     prepared.collapsed.len(),
                     props.is_loading,
                     props.streaming_text.as_ref().map_or(0, String::len),
@@ -1901,6 +2003,8 @@ pub struct MessagesProps {
     /// Maps to: CC `Messages.tsx:314-320,677-684` post-collapse export slice.
     pub render_range: Option<(usize, usize)>,
     pub messages: Arc<Vec<RenderableMessage>>,
+    /// Projection snapshot generation; see `MessagesImplProps`.
+    pub messages_revision: u64,
     /// Maps to: CC `Messages.tsx:262` `conversationId` (REPL.tsx:2017).
     pub conversation_id: u64,
     pub verbose: bool,
@@ -1921,6 +2025,9 @@ pub struct MessagesProps {
     /// site: `false` (:5827).
     pub is_message_selector_visible: bool,
     pub streaming_text: Option<String>,
+    /// Accepted prompt text shown optimistically while `UserPromptSubmit`
+    /// hooks run (see `PENDING_USER_ROW_UUID`).
+    pub pending_user_message: Option<String>,
     pub classifier_checking_tool_use_id: Option<String>,
     pub classifier_checking_is_auto: bool,
     /// Maps to: CC `Messages.tsx:260` `inProgressToolUseIDs: Set<string>` —
@@ -1947,6 +2054,7 @@ pub fn Messages(props: &MessagesProps) -> impl Into<AnyElement<'static>> {
         MessagesImpl(
             render_range: props.render_range,
             messages: Arc::clone(&props.messages),
+            messages_revision: props.messages_revision,
             conversation_id: props.conversation_id,
             is_loading: props.is_loading,
             verbose: props.verbose,
@@ -1958,6 +2066,7 @@ pub fn Messages(props: &MessagesProps) -> impl Into<AnyElement<'static>> {
             tool_use_confirm_queue_len: props.tool_use_confirm_queue_len,
             is_message_selector_visible: props.is_message_selector_visible,
             streaming_text: props.streaming_text.clone(),
+            pending_user_message: props.pending_user_message.clone(),
             classifier_checking_tool_use_id: props.classifier_checking_tool_use_id.clone(),
             classifier_checking_is_auto: props.classifier_checking_is_auto,
             in_progress_tool_use_ids: Arc::clone(&props.in_progress_tool_use_ids),
@@ -2271,6 +2380,67 @@ mod tests {
             .to_string()
     }
 
+    #[derive(Default, Props)]
+    struct MessagesLoadingSteadyRerenderProbeProps {}
+
+    /// Parent frames change a sibling only (`tick`), while `Messages` keeps the
+    /// same messages and a steady `is_loading: true`. Without the memo
+    /// bailout, each parent pass re-entered MessageRows and rebuilt every row.
+    #[component]
+    fn MessagesLoadingSteadyRerenderProbe(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
+        let mut system = hooks.use_context_mut::<SystemContext>();
+        let mut tick = hooks.use_state(|| 0u8);
+        let stable_messages = hooks.use_const(|| Arc::new(messages(3)));
+        if tick.get() < 5 {
+            tick += 1;
+        } else {
+            system.exit();
+        }
+
+        let current_theme = *theme::current();
+        let tick_for_tree = tick.get();
+        element! {
+            ContextProvider(value: Context::owned(current_theme)) {
+                crate::state::app_state::AppStateProvider(
+                    children: crate::state::app_state::ProviderChildren::new(move || element! {
+                        View(flex_direction: FlexDirection::Column, width: 80u32) {
+                            Messages(
+                                messages: Arc::clone(&stable_messages),
+                                hide_logo: true,
+                                is_loading: true,
+                            )
+                            Text(content: format!("tick {tick_for_tree}"))
+                        }
+                    }.into_any()),
+                )
+            }
+        }
+    }
+
+    #[test]
+    fn loading_steady_state_does_not_rebuild_the_sliced_rows() {
+        // Detach from the previous test's count and drive five render-phase
+        // parent ticks. The mount (plus a possible first-frame column settle)
+        // may enter MessageRows; the remaining steady loading frames must bail.
+        reset_message_rows_update_count();
+        let canvases = futures::executor::block_on(
+            element!(MessagesLoadingSteadyRerenderProbe)
+                .mock_terminal_render_loop(MockTerminalConfig::default().with_size(80, 24))
+                .collect::<Vec<_>>(),
+        );
+        let rendered = canvases
+            .last()
+            .expect("mock render should produce a final canvas")
+            .to_string();
+        assert!(rendered.contains("message 0"), "canvas=\n{rendered}");
+        assert!(rendered.contains("tick 5"), "canvas=\n{rendered}");
+        assert!(
+            message_rows_update_count() <= 2,
+            "MessageRows rebuilt {} times across steady loading frames; expected at most the mount + column settle",
+            message_rows_update_count()
+        );
+    }
+
     #[test]
     fn messages_logo_header_renders_status_notices_at_official_boundary() {
         let current_theme = *theme::current();
@@ -2332,6 +2502,43 @@ mod tests {
         );
     }
 
+    /// Issue #18: a slow `UserPromptSubmit` hook must not make the accepted
+    /// prompt disappear. The canonical user row only enters history after the
+    /// hooks settle, so Messages renders the held text in the meantime.
+    #[test]
+    fn messages_render_the_accepted_prompt_while_hooks_run() {
+        let current_theme = *theme::current();
+        let render = |pending: Option<String>| {
+            let pending_for_children = pending.clone();
+            element! {
+                ContextProvider(value: Context::owned(current_theme)) {
+                    crate::state::app_state::AppStateProvider(
+                        children: crate::state::app_state::ProviderChildren::new(move || element! {
+                            Messages(
+                                messages: Arc::new(Vec::new()),
+                                hide_logo: true,
+                                is_loading: true,
+                                pending_user_message: pending_for_children.clone(),
+                            )
+                        }.into_any()),
+                    )
+                }
+            }
+            .render(Some(80))
+            .to_string()
+        };
+
+        let rendered = render(Some("slow hook prompt marker".to_string()));
+        assert!(
+            rendered.contains("slow hook prompt marker"),
+            "canvas=\n{rendered}"
+        );
+        assert!(
+            render(None).trim().is_empty(),
+            "the optimistic row must not survive settlement"
+        );
+    }
+
     /// AppState of a swarm worker waiting on its leader for `tool_use_id`
     /// (swarmWorkerHandler.ts:62-65).
     fn worker_waiting_on(tool_use_id: &str) -> crate::state::app_state_store::AppState {
@@ -2350,6 +2557,7 @@ mod tests {
     #[derive(Default, Props)]
     struct PendingWorkerRequestFlipProbeProps {
         pub store: Option<crate::state::store::AppStore>,
+        pub is_loading: bool,
     }
 
     /// A sibling subscriber whose text always changes with the probe's write,
@@ -2363,14 +2571,16 @@ mod tests {
     }
 
     /// A running tool row while the worker waits on it. The test drives the
-    /// store from outside between captured frames, so Messages' props and the
-    /// idle `is_loading` never change and every memo above the row bails.
+    /// store from outside between captured frames, so Messages' props and
+    /// `is_loading` stay constant and every memo above the row must bail while
+    /// the row's own AppState subscription carries the change through.
     #[component]
     fn PendingWorkerRequestFlipProbe(
         props: &PendingWorkerRequestFlipProbeProps,
         mut hooks: Hooks,
     ) -> impl Into<AnyElement<'static>> {
         let store = props.store.clone().expect("probe store");
+        let is_loading_for_tree = props.is_loading;
         let messages = hooks.use_const(|| {
             Arc::new(vec![tool_use_named_with_input(
                 "assistant-tool",
@@ -2392,7 +2602,7 @@ mod tests {
                         View(flex_direction: FlexDirection::Column) {
                             Messages(
                                 messages: Arc::clone(&messages),
-                                is_loading: false,
+                                is_loading: is_loading_for_tree,
                                 in_progress_tool_use_ids: Arc::clone(&in_progress),
                             )
                             VerboseEcho
@@ -2404,36 +2614,60 @@ mod tests {
     }
 
     #[test]
-    fn messages_idle_tool_row_follows_a_pending_worker_request_store_write() {
+    fn messages_tool_row_follows_a_pending_worker_request_store_write() {
         // Contract D: the row's own AppState subscription gets past the
         // MessagesImpl / MessageRows / MessageRow bailouts, as CC's
         // `useSyncExternalStore` subscriber re-renders past memoized parents.
+        // Run with a steady `is_loading` of both values: the loading state is
+        // no longer a blanket escape hatch, so the subscriber path must carry
+        // the update while a query streams too.
         let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let _fullscreen = EnvVarGuard::set("CLAUDE_CODE_NO_FLICKER", "0");
-        let store = crate::state::store::AppStore::new(worker_waiting_on("toolu_1"), None);
-        // Frame-driven, no timers: take the mount frame, answer the worker
-        // request, then take the frame that write produces. The same write
-        // flips `verbose` for the sibling echo, so a frame always follows.
-        let (mounted, answered) = futures::executor::block_on(async {
-            let mut probe = element!(PendingWorkerRequestFlipProbe(store: Some(store.clone())));
-            let frames = probe
-                .mock_terminal_render_loop(MockTerminalConfig::default().with_size(100, 24));
-            futures::pin_mut!(frames);
-            let mounted = frames.next().await.expect("mount frame").to_string();
-            store.replace_with(|state| {
-                state.pending_worker_request = None;
-                state.verbose = true;
+        for is_loading in [false, true] {
+            let store = crate::state::store::AppStore::new(worker_waiting_on("toolu_1"), None);
+            // Frame-driven, no timers: take the mount frame, answer the worker
+            // request, then take the frame that write produces. The same write
+            // flips `verbose` for the sibling echo, so a frame always follows.
+            let (mounted, answered) = futures::executor::block_on(async {
+                let mut probe = element!(PendingWorkerRequestFlipProbe(
+                    store: Some(store.clone()),
+                    is_loading: is_loading,
+                ));
+                let frames = probe
+                    .mock_terminal_render_loop(MockTerminalConfig::default().with_size(100, 24));
+                futures::pin_mut!(frames);
+                let mounted = frames.next().await.expect("mount frame").to_string();
+                store.replace_with(|state| {
+                    state.pending_worker_request = None;
+                    state.verbose = true;
+                });
+                let mut answered = frames.next().await.expect("frame after the write").to_string();
+                // Settle past any intermediate frame to the one showing the write.
+                while !answered.contains("verbose=true") {
+                    answered = frames.next().await.expect("frame showing the write").to_string();
+                }
+                (mounted, answered)
             });
-            let mut answered = frames.next().await.expect("frame after the write").to_string();
-            // Settle past any intermediate frame to the one showing the write.
-            while !answered.contains("verbose=true") {
-                answered = frames.next().await.expect("frame showing the write").to_string();
-            }
-            (mounted, answered)
-        });
-        assert!(mounted.contains("Waiting for permission…"), "mount frame:\n{mounted}");
-        assert!(mounted.contains("verbose=false"), "mount frame:\n{mounted}");
-        assert!(!answered.contains("Waiting for permission…"), "frame after the write:\n{answered}");
+            assert!(
+                mounted.contains("Waiting for permission…"),
+                "is_loading={is_loading} mount frame:\n{mounted}"
+            );
+            assert!(
+                mounted.contains("verbose=false"),
+                "is_loading={is_loading} mount frame:\n{mounted}"
+            );
+            assert!(
+                !answered.contains("Waiting for permission…"),
+                "is_loading={is_loading} frame after the write:\n{answered}"
+            );
+            // Absence alone would also pass for a blank/disappeared row: the
+            // tool row must keep its rendered command after the permission
+            // wait clears.
+            assert!(
+                answered.contains("echo permission-gated"),
+                "is_loading={is_loading} frame after the write:\n{answered}"
+            );
+        }
     }
 
     #[derive(Default, Props)]
@@ -3461,6 +3695,7 @@ mod tests {
                    pool: &[crate::types::tools::Tool]| {
             message_rows_memo_key(
                 prepared,
+                0,
                 conversation_id,
                 false,
                 verbose,
@@ -3503,7 +3738,7 @@ mod tests {
         let ids = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<HashSet<_>>();
         let with_sets = |in_progress: &HashSet<String>, streaming: &HashSet<String>| {
             message_rows_memo_key(
-                &prepared, 0, false, false, false, true, true, 120, None, false, in_progress,
+                &prepared, 0, 0, false, false, false, true, true, 120, None, false, in_progress,
                 streaming, &pool, ThemeName::Dark,
             )
         };
