@@ -66,7 +66,7 @@ use crate::types::permissions::{PermissionPromptChoice, PermissionPromptResponse
 use crate::utils::classifier_approvals::{ClassifierApprovalsState, ClassifierChecking};
 use crate::utils::config::GlobalConfig;
 use crate::utils::handle_prompt_submit::{HandlePromptSubmit, HandlePromptSubmitResult};
-use crate::utils::messages::{history_model_messages, project_history_rows};
+use crate::utils::messages::{history_model_messages, MessageNormalizer, project_history_rows};
 use crate::utils::permissions::permissions::{apply_prompt_choice, apply_prompt_response};
 use crate::utils::process_user_input::process_slash_command::{
     LocalCommandUi, LocalSettingsTab, SlashCommandAction, SlashCommandInvocation,
@@ -76,8 +76,11 @@ use crate::utils::session_storage::SessionSelection;
 use crate::utils::status_notice_definitions::StatusNoticeContext;
 use crate::utils::swarm::it2_setup_prompt::{It2SetupPrompt, It2SetupPromptRequest};
 use iocraft::prelude::*;
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -1498,7 +1501,7 @@ fn stream_block_type_to_spinner_mode(block_type: &str) -> SpinnerMode {
 /// (per-block `QueryEvent::Message` appends); only never-block-stopped text
 /// lives in the preview, so nothing doubles.
 fn append_partial_streaming_text_message(
-    history_state: &mut State<Arc<Vec<HistoryEntry>>>,
+    history_state: &mut State<HistoryStore>,
     preview: Option<StreamingTextPreview>,
 ) {
     let Some(preview) = preview else {
@@ -1510,9 +1513,7 @@ fn append_partial_streaming_text_message(
     let message = Message::Assistant(crate::utils::messages::create_assistant_message(
         preview.raw,
     ));
-    let mut entries = history_state.read().as_ref().clone();
-    entries.push(HistoryEntry::Message(message));
-    history_state.set(Arc::new(entries));
+    append_history_entries(history_state, vec![HistoryEntry::Message(message)]);
 }
 
 #[derive(Default)]
@@ -1759,22 +1760,423 @@ fn history_entry_from_row(row: RenderableMessage) -> HistoryEntry {
     }
 }
 
-fn append_history_rows(
-    history_state: &mut State<Arc<Vec<HistoryEntry>>>,
-    rows: impl IntoIterator<Item = RenderableMessage>,
-) {
+/// The REPL single history plus its render/model projection.
+///
+/// The projection is maintained next to the entries instead of being recomputed
+/// from the whole Vec on every event. Appends and last-entry progress ticks use
+/// the incremental path; structural edits (tombstone, rewind, compact, clear)
+/// invalidate and rebuild on the next render. The cache lives behind an `Arc`
+/// inside the `State` value so every helper reaches it through the same state
+/// guard, without threading a second parameter through ~50 call sites.
+#[derive(Clone, Default)]
+struct HistoryStore {
+    entries: Arc<Vec<HistoryEntry>>,
+    projection: Arc<Mutex<HistoryProjection>>,
+}
+
+impl HistoryStore {
+    fn new(entries: Vec<HistoryEntry>) -> Self {
+        Self {
+            entries: Arc::new(entries),
+            projection: Arc::new(Mutex::new(HistoryProjection::default())),
+        }
+    }
+
+    fn from_arc(entries: Arc<Vec<HistoryEntry>>) -> Self {
+        Self {
+            entries,
+            projection: Arc::new(Mutex::new(HistoryProjection::default())),
+        }
+    }
+}
+
+impl std::ops::Deref for HistoryStore {
+    type Target = Arc<Vec<HistoryEntry>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+/// Monotonic identity for projection snapshots. Arc pointer identity is not
+/// enough once components hold a `Weak`: the old Arc can be freed and the
+/// allocator can reuse its address for a different row/model Vec. Memo keys
+/// and transcript effects read this revision instead.
+static NEXT_HISTORY_PROJECTION_REVISION: AtomicU64 = AtomicU64::new(1);
+
+fn next_history_projection_revision() -> u64 {
+    NEXT_HISTORY_PROJECTION_REVISION.fetch_add(1, Ordering::Relaxed)
+}
+
+#[derive(Default)]
+struct HistoryProjection {
+    valid: bool,
+    /// Bumped whenever the render-row snapshot changes.
+    rows_revision: u64,
+    normalizer: MessageNormalizer,
+    rows: Arc<Vec<RenderableMessage>>,
+    model: Arc<Vec<Message>>,
+    /// One `(start, len)` per history entry, indexing the flattened row Vec.
+    row_ranges: Vec<(usize, usize)>,
+    /// One model index per entry (`None` for render-only `Row` entries).
+    model_indices: Vec<Option<usize>>,
+    /// Entry UUID to history index, for the streaming replace path.
+    uuid_index: HashMap<String, usize>,
+}
+
+fn progress_renderable(
+    progress: &crate::types::message::ProgressMessage,
+) -> RenderableMessage {
+    RenderableMessage {
+        uuid: progress.uuid.clone(),
+        kind: RenderableMessageKind::Progress {
+            tool_use_id: progress.tool_use_id.clone(),
+            parent_tool_use_id: progress.parent_tool_use_id.clone(),
+            data: progress.data.clone(),
+        },
+    }
+}
+
+fn lock_projection(
+    projection: &Arc<Mutex<HistoryProjection>>,
+) -> std::sync::MutexGuard<'_, HistoryProjection> {
+    projection
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+thread_local! {
+    static HISTORY_PROJECTION_REBUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ARC_VEC_CLONE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_history_projection_rebuild_count() {
+    HISTORY_PROJECTION_REBUILD_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn history_projection_rebuild_count() -> usize {
+    HISTORY_PROJECTION_REBUILD_COUNT.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn reset_arc_vec_clone_count() {
+    ARC_VEC_CLONE_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn arc_vec_clone_count() -> usize {
+    ARC_VEC_CLONE_COUNT.with(std::cell::Cell::get)
+}
+
+impl HistoryProjection {
+    fn invalidate(&mut self) {
+        *self = Self::default();
+    }
+
+    fn ensure(&mut self, entries: &[HistoryEntry]) {
+        if !self.valid
+            || self.row_ranges.len() != entries.len()
+            || self.model_indices.len() != entries.len()
+        {
+            self.rebuild(entries);
+        }
+    }
+
+    fn rebuild(&mut self, entries: &[HistoryEntry]) {
+        #[cfg(test)]
+        HISTORY_PROJECTION_REBUILD_COUNT.with(|count| count.set(count.get() + 1));
+        let mut normalizer = MessageNormalizer::default();
+        let mut rows = Vec::new();
+        let mut model = Vec::new();
+        let mut row_ranges = Vec::with_capacity(entries.len());
+        let mut model_indices = Vec::with_capacity(entries.len());
+        let mut uuid_index = HashMap::with_capacity(entries.len());
+
+        for (index, entry) in entries.iter().enumerate() {
+            match entry {
+                HistoryEntry::Message(message) => {
+                    let start = rows.len();
+                    normalizer.push(message, &mut rows);
+                    row_ranges.push((start, rows.len() - start));
+                    model_indices.push(Some(model.len()));
+                    model.push(message.clone());
+                }
+                HistoryEntry::Row(row) => {
+                    row_ranges.push((rows.len(), 1));
+                    rows.push(row.clone());
+                    model_indices.push(None);
+                }
+                HistoryEntry::ModelOnly(message) => {
+                    row_ranges.push((rows.len(), 0));
+                    model_indices.push(Some(model.len()));
+                    model.push(message.clone());
+                }
+            }
+            uuid_index.insert(entry.uuid().to_string(), index);
+        }
+
+        self.valid = true;
+        self.rows_revision = next_history_projection_revision();
+        self.normalizer = normalizer;
+        self.rows = Arc::new(rows);
+        self.model = Arc::new(model);
+        self.row_ranges = row_ranges;
+        self.model_indices = model_indices;
+        self.uuid_index = uuid_index;
+    }
+
+    /// Extend an already-valid projection by the newly appended entries.
+    fn append(&mut self, entries: &[HistoryEntry]) {
+        if !self.valid || entries.is_empty() {
+            return;
+        }
+        // A panic while updating leaves the projection invalid so the next
+        // render rebuilds instead of trusting a half-appended range table.
+        self.valid = false;
+        let mut rows_changed = false;
+        for entry in entries {
+            let index = self.row_ranges.len();
+            match entry {
+                HistoryEntry::Message(message) => {
+                    let start = self.rows.len();
+                    let mut normalizer = std::mem::take(&mut self.normalizer);
+                    update_arc_vec(&mut self.rows, |rows| normalizer.push(message, rows));
+                    self.normalizer = normalizer;
+                    rows_changed |= self.rows.len() > start;
+                    self.row_ranges.push((start, self.rows.len() - start));
+                    let model_index = self.model.len();
+                    update_arc_vec(&mut self.model, |model| model.push(message.clone()));
+                    self.model_indices.push(Some(model_index));
+                }
+                HistoryEntry::Row(row) => {
+                    let start = self.rows.len();
+                    update_arc_vec(&mut self.rows, |rows| rows.push(row.clone()));
+                    rows_changed = true;
+                    self.row_ranges.push((start, 1));
+                    self.model_indices.push(None);
+                }
+                HistoryEntry::ModelOnly(message) => {
+                    let start = self.rows.len();
+                    self.row_ranges.push((start, 0));
+                    let model_index = self.model.len();
+                    update_arc_vec(&mut self.model, |model| model.push(message.clone()));
+                    self.model_indices.push(Some(model_index));
+                }
+            }
+            self.uuid_index.insert(entry.uuid().to_string(), index);
+        }
+        if rows_changed {
+            self.rows_revision = next_history_projection_revision();
+        }
+        self.valid = true;
+    }
+
+    fn replace_row(&mut self, index: usize, row: &RenderableMessage) -> bool {
+        if !self.valid {
+            return false;
+        }
+        let Some(&(start, len)) = self.row_ranges.get(index) else {
+            return false;
+        };
+        if len != 1 {
+            return false;
+        }
+        self.valid = false;
+        update_arc_vec(&mut self.rows, |rows| rows[start] = row.clone());
+        self.rows_revision = next_history_projection_revision();
+        self.valid = true;
+        true
+    }
+
+    fn replace_progress(
+        &mut self,
+        index: usize,
+        old_uuid: &str,
+        progress: &crate::types::message::ProgressMessage,
+    ) -> bool {
+        if !self.valid {
+            return false;
+        }
+        let Some(&(start, len)) = self.row_ranges.get(index) else {
+            return false;
+        };
+        let Some(Some(model_index)) = self.model_indices.get(index).copied() else {
+            return false;
+        };
+        if len != 1 {
+            return false;
+        }
+        self.valid = false;
+        update_arc_vec(&mut self.rows, |rows| rows[start] = progress_renderable(progress));
+        update_arc_vec(&mut self.model, |model| {
+            model[model_index] = Message::Progress(progress.clone());
+        });
+        self.uuid_index.remove(old_uuid);
+        self.uuid_index.insert(progress.uuid.clone(), index);
+        self.rows_revision = next_history_projection_revision();
+        self.valid = true;
+        true
+    }
+}
+
+/// Mutate the ONE history without deep-cloning its Vec.
+///
+/// The previous `read().clone()` + `set(Arc::new(entries))` pair cloned every
+/// message on every append. Query events (per-block messages, progress ticks,
+/// rows, tombstones) run through here repeatedly, so a long session paid
+/// O(history) allocations per event and became progressively slower — the
+/// reported `运行时间长了之后非常卡`.
+///
+/// `Arc::make_mut` only clones when another strong reference is still live;
+/// the between-frames case is O(1). The fresh `Arc` identity at the end is
+/// required by every memo/cache keyed on `Arc::as_ptr`. Structural mutations
+/// invalidate the incremental projection; append-only callers use
+/// [`append_history_entries`] so the next render does not reproject the Vec.
+fn update_history_entries<R>(
+    history_state: &mut State<HistoryStore>,
+    update: impl FnOnce(&mut Vec<HistoryEntry>) -> R,
+) -> Option<R> {
     // Owned async local-jsx callbacks can finish after REPL unmount. Like
     // React setState, the terminal State setter then becomes a safe no-op.
-    let Some(mut history) = history_state.try_write() else {
+    let mut store = history_state.try_write()?;
+    let projection = Arc::clone(&store.projection);
+    // Invalidate before mutating: if `update` unwinds, the entries are still
+    // re-published by the guard, and the projection must not remain valid
+    // against the changed prefix.
+    lock_projection(&projection).invalidate();
+    let output = update_history_vec(&mut store.entries, update);
+    Some(output)
+}
+
+/// Mutate one history `Arc` in place and publish a new identity.
+///
+/// Split from [`update_history_entries`] so the panic path is testable. The
+/// old implementation left the history Vec moved out of the Arc until `update`
+/// returned; a panic then dropped the entries and published an EMPTY Vec at
+/// the same address, so a projection keyed on the pointer could still match
+/// and serve stale rows. The guard republishes the entries the closure
+/// produced on unwind too (partial mutations included; it is not a rollback),
+/// and the fresh Arc makes every projection/memo key observe the change.
+fn update_history_vec<R>(
+    history: &mut Arc<Vec<HistoryEntry>>,
+    update: impl FnOnce(&mut Vec<HistoryEntry>) -> R,
+) -> R {
+    update_arc_vec(history, update)
+}
+
+/// Mutate one `Arc<Vec<T>>` in place, publishing a fresh Arc identity on
+/// success AND unwind. Used for history entries and for the row/model
+/// projections: every mutation must publish a new identity because the
+/// `Messages`/`PromptInput` memo keys use `Arc::as_ptr`.
+fn update_arc_vec<T: Clone, R>(arc: &mut Arc<Vec<T>>, update: impl FnOnce(&mut Vec<T>) -> R) -> R {
+    #[cfg(test)]
+    if Arc::get_mut(arc).is_none() {
+        ARC_VEC_CLONE_COUNT.with(|count| count.set(count.get() + 1));
+    }
+    struct PublishOnDrop<'a, T> {
+        arc: &'a mut Arc<Vec<T>>,
+        entries: Option<Vec<T>>,
+    }
+
+    impl<T> Drop for PublishOnDrop<'_, T> {
+        fn drop(&mut self) {
+            if let Some(entries) = self.entries.take() {
+                *self.arc = Arc::new(entries);
+            }
+        }
+    }
+
+    let entries = std::mem::take(Arc::make_mut(arc));
+    let mut publish = PublishOnDrop {
+        arc,
+        entries: Some(entries),
+    };
+    update(
+        publish
+            .entries
+            .as_mut()
+            .expect("entries stay present until the publish guard drops"),
+    )
+}
+
+fn append_history_entries(
+    history_state: &mut State<HistoryStore>,
+    new_entries: Vec<HistoryEntry>,
+) {
+    let Some(mut store) = history_state.try_write() else {
         return;
     };
-    let mut entries = history.as_ref().clone();
-    entries.extend(rows.into_iter().map(history_entry_from_row));
-    *history = Arc::new(entries);
+    let projection = Arc::clone(&store.projection);
+    let start = store.entries.len();
+    Arc::make_mut(&mut store.entries).extend(new_entries);
+    lock_projection(&projection).append(&store.entries[start..]);
+}
+
+/// Streaming replace: append a new UUID or replace an existing render-only
+/// `Row`/progress entry in place. Replacing a model `Message` needs the block
+/// normalizer, so it falls back to a full reprojection.
+fn push_history_entry(history_state: &mut State<HistoryStore>, entry: HistoryEntry) {
+    let Some(mut store) = history_state.try_write() else {
+        return;
+    };
+    let projection = Arc::clone(&store.projection);
+    let uuid = entry.uuid().to_string();
+    let (projection_valid, cached_index) = {
+        let projection = lock_projection(&projection);
+        (
+            projection.valid,
+            projection.uuid_index.get(&uuid).copied(),
+        )
+    };
+    // An invalid projection has no UUID table, but replace-by-UUID is still
+    // part of this seam's contract (the old linear scan did it). Fall back to
+    // that scan so a re-yield after a tombstone/invalidate cannot duplicate.
+    let existing = if projection_valid {
+        cached_index
+    } else {
+        store.entries.iter().position(|entry| entry.uuid() == uuid.as_str())
+    };
+
+    if let Some(index) = existing {
+        if projection_valid {
+            if let HistoryEntry::Row(row) = &entry {
+                let replaced = lock_projection(&projection).replace_row(index, row);
+                if replaced {
+                    Arc::make_mut(&mut store.entries)[index] = entry;
+                    return;
+                }
+            }
+        }
+        Arc::make_mut(&mut store.entries)[index] = entry;
+        lock_projection(&projection).invalidate();
+        return;
+    }
+
+    let start = store.entries.len();
+    Arc::make_mut(&mut store.entries).push(entry);
+    lock_projection(&projection).append(&store.entries[start..]);
+}
+
+fn replace_history(history_state: &mut State<HistoryStore>, entries: Vec<HistoryEntry>) {
+    let Some(mut store) = history_state.try_write() else {
+        return;
+    };
+    *store = HistoryStore::new(entries);
+}
+
+fn append_history_rows(
+    history_state: &mut State<HistoryStore>,
+    rows: impl IntoIterator<Item = RenderableMessage>,
+) {
+    let entries = rows.into_iter().map(history_entry_from_row).collect();
+    append_history_entries(history_state, entries);
 }
 
 fn append_prompt_submit_result(
-    history_state: &mut State<Arc<Vec<HistoryEntry>>>,
+    history_state: &mut State<HistoryStore>,
     pending_responses: &mut State<Vec<PendingRuntimeMessage>>,
     result: HandlePromptSubmitResult,
 ) {
@@ -1788,6 +2190,7 @@ fn append_prompt_submit_result(
 /// re-sends the same-uuid message/row updates the entry in place instead of
 /// duplicating it (CC never re-yields; its special-case replacements are the
 /// ephemeral-progress arm `REPL.tsx:3482-3496` and the tombstone filter).
+#[cfg(test)]
 fn push_or_replace_entry(entries: &mut Vec<HistoryEntry>, entry: HistoryEntry) {
     if let Some(existing) = entries
         .iter_mut()
@@ -1839,7 +2242,7 @@ fn truncate_history_before_row(
 /// L1: the selector's normalized row uuid identifies the original history
 /// entry; input restoration always uses that entry, never its display title.
 fn rewind_conversation_to(
-    mut history: State<Arc<Vec<HistoryEntry>>>,
+    mut history: State<HistoryStore>,
     mut conversation_id: State<u64>,
     store: &crate::state::store::AppStore,
     row_uuid: &str,
@@ -1854,7 +2257,7 @@ fn rewind_conversation_to(
         }) => message.clone(),
         _ => return None,
     };
-    history.set(Arc::new(truncated));
+    replace_history(&mut history, truncated);
     conversation_id.set(conversation_id.get().wrapping_add(1));
     crate::services::compact::micro_compact::reset_microcompact_state();
     store.set_state(|prev| {
@@ -1977,7 +2380,7 @@ pub(crate) fn subagent_progress_render_message(
 /// same `data.type`; everything else appends and the consumer picks the
 /// newest (`BashTool/UI.tsx:140` `.at(-1)`).
 fn update_tool_use_progress_message(
-    history_state: &mut State<Arc<Vec<HistoryEntry>>>,
+    history_state: &mut State<HistoryStore>,
     progress_tool_use_id: &str,
     progress: crate::types::message::ToolUseProgressMessage,
 ) {
@@ -1994,15 +2397,45 @@ fn update_tool_use_progress_message(
         parent_tool_use_id: progress_tool_use_id.to_string(),
         data: progress,
     };
-    let mut entries = history_state.read().as_ref().clone();
-    push_or_replace_progress_entry(&mut entries, new_message);
-    history_state.set(Arc::new(entries));
+
+    let Some(mut store) = history_state.try_write() else {
+        return;
+    };
+    let projection = Arc::clone(&store.projection);
+    let entries = Arc::make_mut(&mut store.entries);
+    let replace_index = crate::utils::session_storage::is_ephemeral_tool_progress(
+        new_message.data.wire_type(),
+    )
+    .then(|| {
+        entries.last().and_then(|entry| {
+            let HistoryEntry::Message(Message::Progress(last)) = entry else {
+                return None;
+            };
+            (last.parent_tool_use_id == new_message.parent_tool_use_id
+                && last.data.wire_type() == new_message.data.wire_type())
+                .then(|| entries.len().saturating_sub(1))
+        })
+    })
+    .flatten();
+
+    if let Some(index) = replace_index {
+        let old_uuid = entries[index].uuid().to_string();
+        entries[index] = HistoryEntry::Message(Message::Progress(new_message.clone()));
+        if !lock_projection(&projection).replace_progress(index, &old_uuid, &new_message) {
+            lock_projection(&projection).invalidate();
+        }
+    } else {
+        let start = entries.len();
+        entries.push(HistoryEntry::Message(Message::Progress(new_message)));
+        lock_projection(&projection).append(&entries[start..]);
+    }
 }
 
 /// Maps to: CC `REPL.tsx:3482-3494` — `last?.type === 'progress' &&
 /// last.parentToolUseID === newMessage.parentToolUseID && last.data.type ===
 /// newMessage.data.type` → replace the previous ephemeral tick in place;
 /// otherwise append.
+#[cfg(test)]
 fn push_or_replace_progress_entry(
     entries: &mut Vec<HistoryEntry>,
     new_message: crate::types::message::ProgressMessage,
@@ -2138,15 +2571,16 @@ fn ClearLiveOutputOnMount(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
 /// projection drops them (`normalizeMessagesForAPI`, utils/messages.ts:2067)
 /// and the render projection passes them through untouched.
 fn push_system_notice(
-    history_state: &mut State<Arc<Vec<HistoryEntry>>>,
+    history_state: &mut State<HistoryStore>,
     level: SystemMessageLevel,
     text: impl Into<String>,
 ) {
-    let mut entries = history_state.read().as_ref().clone();
-    entries.push(HistoryEntry::Message(Message::System(
-        SystemMessage::informational(text, level),
-    )));
-    history_state.set(Arc::new(entries));
+    append_history_entries(
+        history_state,
+        vec![HistoryEntry::Message(Message::System(
+            SystemMessage::informational(text, level),
+        ))],
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2168,6 +2602,7 @@ fn messages_memo_key(
 ) -> String {
     messages_memo_key_for_screen(
         messages,
+        0,
         conversation_id,
         is_loading,
         verbose,
@@ -2181,6 +2616,7 @@ fn messages_memo_key(
         classifier_checking_is_auto,
         status_notice_context,
         streaming_text,
+        None,
         Screen::Prompt,
         false,
         in_progress_tool_use_ids,
@@ -2193,6 +2629,7 @@ fn messages_memo_key(
 #[allow(clippy::too_many_arguments)]
 fn messages_memo_key_for_screen(
     messages: &Arc<Vec<RenderableMessage>>,
+    messages_revision: u64,
     conversation_id: u64,
     is_loading: bool,
     verbose: bool,
@@ -2207,6 +2644,7 @@ fn messages_memo_key_for_screen(
     classifier_checking_is_auto: bool,
     status_notice_context: &StatusNoticeContext,
     streaming_text: Option<&str>,
+    pending_user_message: Option<&str>,
     screen: Screen,
     show_all_in_transcript: bool,
     in_progress_tool_use_ids: &std::collections::HashSet<String>,
@@ -2231,9 +2669,10 @@ fn messages_memo_key_for_screen(
     // Not a CC comparator term: React re-renders Messages' themed descendants
     // past the memo when the ThemeProvider value changes; iocraft does not.
     format!(
-        "messages:{:?}:{:p}:{}:{}:{:?}:{:?}:{}:{}:{}:{}:{}:{:?}:{}:{}:{:?}:{}:{:?}:{:?}:{:?}:{}:{:?}:{:?}:{}",
+        "messages:{:?}:{:p}:{}:{}:{}:{:?}:{:?}:{}:{}:{}:{}:{}:{:?}:{}:{}:{:?}:{}:{:?}:{:?}:{:?}:{:?}:{}:{:?}:{:?}:{}",
         theme,
         Arc::as_ptr(messages),
+        messages_revision,
         messages.len(),
         conversation_id,
         messages.first().map(|message| message.uuid.as_str()),
@@ -2250,6 +2689,7 @@ fn messages_memo_key_for_screen(
         classifier_checking_is_auto,
         status_notice_context,
         streaming_text,
+        pending_user_message,
         screen,
         show_all_in_transcript,
         live_tool_use_ids,
@@ -2395,6 +2835,7 @@ fn memoized_messages(
 ) -> AnyElement<'static> {
     memoized_messages_for_screen(
         messages,
+        0,
         conversation_id,
         is_loading,
         verbose,
@@ -2407,6 +2848,7 @@ fn memoized_messages(
         classifier_approvals,
         status_notice_context,
         streaming_text,
+        None,
         Screen::Prompt,
         false,
         in_progress_tool_use_ids,
@@ -2422,6 +2864,7 @@ fn memoized_messages(
 #[allow(clippy::too_many_arguments)]
 fn memoized_messages_for_screen(
     messages: Arc<Vec<RenderableMessage>>,
+    messages_revision: u64,
     conversation_id: u64,
     is_loading: bool,
     verbose: bool,
@@ -2439,6 +2882,9 @@ fn memoized_messages_for_screen(
     classifier_approvals: ClassifierApprovalsState,
     status_notice_context: StatusNoticeContext,
     streaming_text: Option<String>,
+    // Accepted prompt text held for `UserPromptSubmit` hooks; rendered as an
+    // optimistic user row until the canonical entry lands in history.
+    pending_user_message: Option<String>,
     screen: Screen,
     show_all_in_transcript: bool,
     in_progress_tool_use_ids: Arc<std::collections::HashSet<String>>,
@@ -2455,6 +2901,7 @@ fn memoized_messages_for_screen(
     // net for tests and direct callers.
     let memo_key = messages_memo_key_for_screen(
         &messages,
+        messages_revision,
         conversation_id,
         is_loading,
         verbose,
@@ -2468,6 +2915,7 @@ fn memoized_messages_for_screen(
         classifier_approvals.checking_is_auto(),
         &status_notice_context,
         streaming_text.as_deref(),
+        pending_user_message.as_deref(),
         screen,
         show_all_in_transcript,
         &in_progress_tool_use_ids,
@@ -2487,6 +2935,7 @@ fn memoized_messages_for_screen(
         Memo(key: format!("messages-{screen:?}"), memo_key: memo_key, compare: memo_key_eq as MemoComparator) {
             Messages(
                 messages: messages,
+                messages_revision: messages_revision,
                 conversation_id: conversation_id,
                 is_loading: is_loading,
                 verbose: verbose || screen == Screen::Transcript,
@@ -2500,6 +2949,7 @@ fn memoized_messages_for_screen(
                 classifier_checking_is_auto: classifier_checking_is_auto,
                 status_notice_context: status_notice_context,
                 streaming_text: streaming_text,
+                pending_user_message: pending_user_message,
                 in_progress_tool_use_ids: in_progress_tool_use_ids,
                 streaming_tool_use_ids: streaming_tool_use_ids,
                 // CC `REPL.tsx:5821` / `:6162` `tools={tools}`.
@@ -2804,7 +3254,7 @@ fn explicit_local_model_messages(messages: &[RenderableMessage]) -> Vec<Message>
 }
 
 fn append_model_visible_local_command_result(
-    history_state: &mut State<Arc<Vec<HistoryEntry>>>,
+    history_state: &mut State<HistoryStore>,
     invocation: &SlashCommandInvocation,
     output: &str,
 ) {
@@ -2839,7 +3289,7 @@ fn local_command_ui_dismiss_messages(active: &ActiveLocalCommandUi) -> Vec<Rende
 }
 
 fn append_local_command_invocation_result(
-    history_state: &mut State<Arc<Vec<HistoryEntry>>>,
+    history_state: &mut State<HistoryStore>,
     invocation: &LocalCommandInvocation,
     output: &str,
     is_error: bool,
@@ -2851,7 +3301,7 @@ fn append_local_command_invocation_result(
 }
 
 fn append_local_command_ui_dismiss_result(
-    history_state: &mut State<Arc<Vec<HistoryEntry>>>,
+    history_state: &mut State<HistoryStore>,
     active: &ActiveLocalCommandUi,
 ) {
     append_history_rows(history_state, local_command_ui_dismiss_messages(active));
@@ -3581,7 +4031,7 @@ fn seed_history_entries(
 /// Maps to: CC `screens/REPL.tsx#resume` post-load state commit
 /// (`setMessages`, restore stores, agent state, and input/session reset).
 fn apply_resume_restore_result(
-    history_state: &mut State<Arc<Vec<HistoryEntry>>>,
+    history_state: &mut State<HistoryStore>,
     pending_responses: &mut State<Vec<PendingRuntimeMessage>>,
     content_replacement_state: &mut State<
         crate::utils::tool_result_storage::ContentReplacementState,
@@ -3619,7 +4069,7 @@ fn apply_resume_restore_result(
     loaded_nested_memory_paths.set(std::collections::HashSet::new());
     main_thread_agent_definition.set(result.restored_agent_def.clone());
     pending_responses.set(Vec::new());
-    history_state.set(Arc::new(seed_history_entries(
+    history_state.set(HistoryStore::new(seed_history_entries(
         &result.messages,
         &result.renderable_messages,
     )));
@@ -3807,7 +4257,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
         let initial_model_messages = initial_model_messages.clone();
         let initial_renderable_messages = initial_renderable_messages;
         move || {
-            Arc::new(seed_history_entries(
+            HistoryStore::new(seed_history_entries(
                 &initial_model_messages,
                 &initial_renderable_messages,
             ))
@@ -4468,7 +4918,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                         .map(HistoryEntry::Message),
                 );
                 let entries = Arc::new(entries);
-                history_state.set(Arc::clone(&entries));
+                history_state.set(HistoryStore::from_arc(Arc::clone(&entries)));
                 let history = history_model_messages(&entries);
                 let rendered = project_history_rows(&entries);
                 // B3 flip-audit: CC's single accept-time clear
@@ -4646,7 +5096,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                     {
                         let mut entries = history_state.read().as_ref().clone();
                         entries.extend(post_messages.into_iter().map(HistoryEntry::Message));
-                        history_state.set(Arc::new(entries));
+                        history_state.set(HistoryStore::new(entries));
                     }
                     // CC REPL.tsx:3662-3664: bump conversationId so row keys
                     // change and stale memoized rows remount.
@@ -5069,7 +5519,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                         previous[..index].to_vec()
                     } else { Vec::new() };
                     entries.extend(post.into_iter().map(HistoryEntry::Message));
-                    history_state.set(Arc::new(entries));
+                    history_state.set(HistoryStore::new(entries));
                     conversation_id.set(conversation_id.get().wrapping_add(1));
                     crate::services::compact::post_compact_cleanup::run_post_compact_cleanup(None);
                     if direction == PartialCompactDirection::From {
@@ -5387,15 +5837,13 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                                 // randomUUID())` (REPL.tsx:3461-3463) so
                                 // stale memoized rows remount.
                                 history_state
-                                    .set(Arc::new(vec![HistoryEntry::Message(message)]));
+                                    .set(HistoryStore::new(vec![HistoryEntry::Message(message)]));
                                 conversation_id += 1;
                             } else {
-                                let mut entries = history_state.read().as_ref().clone();
-                                push_or_replace_entry(
-                                    &mut entries,
+                                push_history_entry(
+                                    &mut history_state,
                                     HistoryEntry::Message(message),
                                 );
-                                history_state.set(Arc::new(entries));
                             }
                         }
                         Ok(QueryEvent::AssistantDelta {
@@ -5410,17 +5858,18 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                             // the final usage/stop_reason. Rust applies the
                             // same mutation by uuid: the history entry in
                             // place, then the queued entry before its 100 ms drain.
-                            let mut entries = history_state.read().as_ref().clone();
-                            if let Some(HistoryEntry::Message(Message::Assistant(assistant))) =
-                                entries
+                            let _ = update_history_entries(&mut history_state, |entries| {
+                                if let Some(HistoryEntry::Message(Message::Assistant(
+                                    assistant,
+                                ))) = entries
                                     .iter_mut()
                                     .rev()
                                     .find(|entry| entry.uuid() == uuid.as_str())
-                            {
-                                assistant.stop_reason = stop_reason.clone();
-                                assistant.usage = usage.clone();
-                                history_state.set(Arc::new(entries));
-                            }
+                                {
+                                    assistant.stop_reason = stop_reason.clone();
+                                    assistant.usage = usage.clone();
+                                }
+                            });
                             if let Err(error) = crate::utils::session_storage::apply_assistant_delta_to_queued_record(&uuid,
                             stop_reason,
                             usage,)
@@ -5435,9 +5884,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                             // render halves); history is fed by the paired
                             // ModelMessage arm.
                             streaming_text_preview.set(None);
-                            let mut entries = history_state.read().as_ref().clone();
-                            push_or_replace_entry(&mut entries, HistoryEntry::Row(message));
-                            history_state.set(Arc::new(entries));
+                            push_history_entry(&mut history_state, HistoryEntry::Row(message));
                         }
                         // Maps to CC `REPL.tsx:3910` `setStreamingToolUses`.
                         Ok(QueryEvent::StreamingToolUseStarted { tool_use_id }) => {
@@ -5464,9 +5911,9 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                         }
                         Ok(QueryEvent::Tombstone(tombstone)) => {
                             let tombstone_uuid = tombstone.message.uuid().to_string();
-                            let mut entries = history_state.read().as_ref().clone();
-                            remove_tombstoned_entry(&mut entries, &tombstone_uuid);
-                            history_state.set(Arc::new(entries));
+                            let _ = update_history_entries(&mut history_state, |entries| {
+                                remove_tombstoned_entry(entries, &tombstone_uuid);
+                            });
                             // Maps to CC `REPL.tsx:3521-3525` tombstone
                             // callback: `void removeTranscriptMessage(
                             // tombstonedMessage.uuid)`.
@@ -5605,9 +6052,10 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                             // render half arrived as `Row` entries, so it
                             // enters the one history as `ModelOnly` (the
                             // render projection must not draw it twice).
-                            let mut entries = history_state.read().as_ref().clone();
-                            entries.push(HistoryEntry::ModelOnly(message));
-                            history_state.set(Arc::new(entries));
+                            append_history_entries(
+                                &mut history_state,
+                                vec![HistoryEntry::ModelOnly(message)],
+                            );
                         }
                         Ok(QueryEvent::ApiError(_)) => {
                             // The paired QueryEvent::Message owns rendering;
@@ -5791,7 +6239,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
 
                     pending_responses.set(waiting);
                     permission_queue.set(permissions);
-                    history_state.set(Arc::new(entries));
+                    history_state.set(HistoryStore::new(entries));
 
                     if blocked_on_permission {
                         break;
@@ -6554,7 +7002,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                     // The command/hook rows are System kinds → render-only `Row`
                     // entries, so the post-clear model projection is empty (the old
                     // explicit `model_history = []`).
-                    history_state.set(Arc::new(
+                    history_state.set(HistoryStore::new(
                         cleared_messages
                             .into_iter()
                             .map(history_entry_from_row)
@@ -7123,7 +7571,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
             });
             let mut entries = history_state.read().as_ref().clone();
             entries.push(HistoryEntry::Message(user_message));
-            history_state.set(Arc::new(entries));
+            history_state.set(HistoryStore::new(entries));
             let clean_messages =
                 crate::services::prompt_suggestion::speculation::prepare_messages_for_injection(
                     &active
@@ -7581,7 +8029,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                                     content: text,
                                 },
                             )));
-                            history_state.set(Arc::new(entries));
+                            history_state.set(HistoryStore::new(entries));
                         }
                     }
                 }
@@ -7693,7 +8141,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                         crate::commands::clear::clear_conversation(&app_store_for_cron);
                     let mut cleared_messages = result.messages.clone();
                     cleared_messages.extend(clear_outcome.session_start_messages);
-                    history_state.set(Arc::new(
+                    history_state.set(HistoryStore::new(
                         cleared_messages
                             .into_iter()
                             .map(history_entry_from_row)
@@ -8140,9 +8588,10 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     // before onDone. Keep this system member in the typed session ledger;
     // API normalization, not display-row transport, filters it for the model.
     let on_permissions_message = move |message: Message| {
-        let mut entries = history_state.read().as_ref().clone();
-        entries.push(HistoryEntry::Message(message));
-        history_state.set(Arc::new(entries));
+        append_history_entries(
+            &mut history_state,
+            vec![HistoryEntry::Message(message)],
+        );
     };
     let permission_notification_store = app_store.clone();
     let permission_query_action = prompt_query_action.clone();
@@ -8174,11 +8623,17 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                             }
                         }
                     }
-                    let mut entries = history_state.read().as_ref().clone();
-                    entries.extend(done.meta_messages.into_iter().map(|text| HistoryEntry::Message(Message::User(
-                        crate::utils::messages::create_user_message_with_meta(text, true),
-                    ))));
-                    history_state.set(Arc::new(entries));
+                    append_history_entries(
+                        &mut history_state,
+                        done.meta_messages
+                            .into_iter()
+                            .map(|text| {
+                                HistoryEntry::Message(Message::User(
+                                    crate::utils::messages::create_user_message_with_meta(text, true),
+                                ))
+                            })
+                            .collect(),
+                    );
                 } else {
                     let result = crate::utils::process_user_input::process_slash_command::local_jsx_command_result(
                         command, args, done.result.as_deref(), done.display, done.should_query, &done.meta_messages,
@@ -8591,39 +9046,24 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     }
 
     // Maps to: CC `Messages.tsx` `useMemo(() => normalizeMessages(messages),
-    // [messages])` — the render rows and the model view are per-commit
-    // projections of the single history, cached on the history Arc identity so
-    // the Messages memo key (`Arc::as_ptr`) stays stable across unrelated
-    // renders. The cache holds the source Arc it projected, making
-    // `Arc::ptr_eq` sound (a live allocation's address cannot be reused — a
-    // raw-pointer `use_memo` key would be an ABA hazard after two consecutive
-    // sets between renders).
-    let history_snapshot = {
-        let current = history_state.read();
-        Arc::clone(&*current)
-    };
-    let mut history_projection_cache = hooks.use_ref(|| {
-        Option::<(
-            Arc<Vec<HistoryEntry>>,
-            Arc<Vec<RenderableMessage>>,
-            Arc<Vec<Message>>,
-        )>::None
-    });
-    let (messages, model_messages) = {
-        let cached = history_projection_cache.read().clone();
-        match cached {
-            Some((source, rows, model)) if Arc::ptr_eq(&source, &history_snapshot) => (rows, model),
-            _ => {
-                let rows = Arc::new(project_history_rows(&history_snapshot));
-                let model = Arc::new(history_model_messages(&history_snapshot));
-                history_projection_cache.set(Some((
-                    Arc::clone(&history_snapshot),
-                    Arc::clone(&rows),
-                    Arc::clone(&model),
-                )));
-                (rows, model)
-            }
-        }
+    // [messages])` — the render rows and model view are projections of the
+    // single history. `HistoryStore` maintains them incrementally next to the
+    // entries: append-only query events project only their new entries, and a
+    // last-entry progress tick replaces one row/model slot. Structural edits
+    // invalidate the cache and the next render rebuilds once.
+    let (messages, model_messages, messages_revision) = {
+        // Hold the history read guard while locking the projection: mutation
+        // helpers take the history write guard first and the projection lock
+        // second, so this order cannot deadlock and the frame commits one
+        // coherent (entries, rows, model) triple.
+        let store = history_state.read();
+        let mut projection = lock_projection(&store.projection);
+        projection.ensure(&store.entries);
+        (
+            Arc::clone(&projection.rows),
+            Arc::clone(&projection.model),
+            projection.rows_revision,
+        )
     };
     #[cfg(test)]
     if let Some(probe) = active_query_probe.as_ref() {
@@ -9506,6 +9946,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
             #(if is_empty_session {
                 Some(memoized_messages_for_screen(
                     messages.clone(),
+                    messages_revision,
                     conversation_generation,
                     false,
                     verbose,
@@ -9518,6 +9959,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                     classifier_approvals.read().clone(),
                     status_notice_context.clone(),
                     None,
+                    user_input_on_processing.read().clone(),
                     screen.get(),
                     show_all_in_transcript.get(),
                     Arc::clone(&in_progress_tool_use_ids_value),
@@ -9534,6 +9976,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
             #(if !messages.is_empty() || is_loading {
                 Some(memoized_messages_for_screen(
                     messages.clone(),
+                    messages_revision,
                     conversation_generation,
                     is_loading,
                     verbose,
@@ -9546,6 +9989,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                     classifier_approvals.read().clone(),
                     status_notice_context.clone(),
                     streaming_text_for_messages.clone(),
+                    user_input_on_processing.read().clone(),
                     screen.get(),
                     show_all_in_transcript.get(),
                     Arc::clone(&in_progress_tool_use_ids_value),
@@ -11578,7 +12022,7 @@ mod tests {
     #[component]
     fn ForkRestoreCommitHarness(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
         let probe = hooks.use_context::<ForkRestoreCommitProbe>().clone();
-        let mut history = hooks.use_state(|| Arc::new(Vec::new()));
+        let mut history = hooks.use_state(|| HistoryStore::new(Vec::new()));
         let mut pending = hooks.use_state(Vec::new);
         let mut replacement =
             hooks.use_state(
@@ -13160,6 +13604,174 @@ mod tests {
         remove_tombstoned_entry(&mut entries, "drop");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].uuid(), "keep");
+    }
+
+    /// The projection cache is keyed on the history Arc identity, so a normal
+    /// mutation must publish a new Arc (the old Weak must no longer upgrade).
+    /// If the update closure panics, the old code left the Arc holding the
+    /// `mem::take` empty Vec at the SAME address — the cache would still match
+    /// and serve pre-panic rows. The guard must republish the entries and
+    /// change the identity on unwind too.
+    #[test]
+    fn history_mutation_publishes_a_new_arc_and_survives_a_panic() {
+        let mut history = Arc::new(vec![HistoryEntry::Row(RenderableMessage::user(
+            "u1", "hello",
+        ))]);
+        let before = Arc::downgrade(&history);
+        update_history_vec(&mut history, |entries| {
+            entries.push(HistoryEntry::Row(RenderableMessage::user(
+                "u2", "again",
+            )));
+        });
+        assert_eq!(history.len(), 2);
+        assert!(
+            before.upgrade().is_none(),
+            "a mutation must publish a fresh Arc identity"
+        );
+
+        let mut history = Arc::new(vec![HistoryEntry::Row(RenderableMessage::user(
+            "u1", "hello",
+        ))]);
+        let before = Arc::downgrade(&history);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            update_history_vec(&mut history, |entries| {
+                assert_eq!(entries.len(), 1);
+                panic!("simulated history update failure");
+            });
+        }));
+        assert!(result.is_err());
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].uuid(), "u1");
+        assert!(
+            before.upgrade().is_none(),
+            "the unwind path must also publish a fresh Arc identity"
+        );
+    }
+
+    #[test]
+    fn incremental_projection_matches_full_rebuild_for_appends_and_replacements() {
+        let user = |uuid: &str, text: &str| {
+            history_entry_from_row(RenderableMessage::user(uuid, text))
+        };
+        let entries = vec![
+            user("u1", "one"),
+            HistoryEntry::Row(RenderableMessage::system("r1", "row")),
+            user("u2", "two"),
+            HistoryEntry::Message(Message::Progress(progress_history_entry(
+                "toolu_1",
+                bash_tick("tick"),
+            ))),
+            HistoryEntry::ModelOnly(Message::System(SystemMessage::informational(
+                "model-only",
+                SystemMessageLevel::Info,
+            ))),
+        ];
+
+        let mut projection = HistoryProjection::default();
+        reset_history_projection_rebuild_count();
+        projection.rebuild(&entries[..2]);
+        projection.append(&entries[2..]);
+        assert_eq!(*projection.rows, project_history_rows(&entries));
+        assert_eq!(*projection.model, history_model_messages(&entries));
+        assert_eq!(projection.uuid_index.len(), entries.len());
+
+        let replacement = RenderableMessage::system("r1", "updated");
+        assert!(projection.replace_row(1, &replacement));
+        let mut changed = entries.clone();
+        changed[1] = HistoryEntry::Row(replacement);
+        assert_eq!(*projection.rows, project_history_rows(&changed));
+
+        let old_uuid = match &entries[3] {
+            HistoryEntry::Message(Message::Progress(progress)) => progress.uuid.clone(),
+            _ => unreachable!(),
+        };
+        let new_progress = progress_history_entry("toolu_1", bash_tick("new tick"));
+        assert!(projection.replace_progress(3, &old_uuid, &new_progress));
+        changed[3] = HistoryEntry::Message(Message::Progress(new_progress.clone()));
+        assert_eq!(*projection.rows, project_history_rows(&changed));
+        assert_eq!(*projection.model, history_model_messages(&changed));
+        assert!(projection.uuid_index.contains_key(&new_progress.uuid));
+        assert!(!projection.uuid_index.contains_key(&old_uuid));
+        assert_eq!(
+            history_projection_rebuild_count(),
+            1,
+            "append/row/progress updates must not reproject the history"
+        );
+    }
+
+    /// A stable frame leaves the projection's row/model Arcs unretained, so
+    /// appending must not go through `Arc::make_mut`'s deep clone.
+    #[test]
+    fn projection_append_reuses_unretained_row_and_model_buffers() {
+        let entries = vec![
+            history_entry_from_row(RenderableMessage::user("u1", "one")),
+            history_entry_from_row(RenderableMessage::user("u2", "two")),
+        ];
+        let mut projection = HistoryProjection::default();
+        projection.rebuild(&entries[..1]);
+        reset_arc_vec_clone_count();
+        projection.append(&entries[1..]);
+        assert_eq!(
+            arc_vec_clone_count(),
+            0,
+            "an unretained projection buffer must append without cloning its Vec"
+        );
+    }
+
+    /// The normalizer's `is_new_chain` state flips once a multi-block message
+    /// is seen; an incremental append must keep deriving split-row UUIDs for
+    /// messages that arrive after it.
+    #[test]
+    fn incremental_projection_keeps_normalizer_chain_state_for_tail_appends() {
+        let user = |uuid: &str, text: &str| {
+            history_entry_from_row(RenderableMessage::user(uuid, text))
+        };
+        let multi = Message::Assistant(crate::types::message::AssistantMessage {
+            uuid: "a-multi".to_string(),
+            timestamp: chrono::Utc::now(),
+            content: vec![
+                crate::types::message::AssistantContent::Text("one".to_string()),
+                crate::types::message::AssistantContent::Text("two".to_string()),
+            ],
+            model: None,
+            stop_reason: None,
+            usage: None,
+        });
+        let entries = vec![
+            user("u1", "q"),
+            HistoryEntry::Message(multi),
+            user("u2", "next"),
+        ];
+
+        let mut projection = HistoryProjection::default();
+        projection.rebuild(&entries[..2]);
+        projection.append(&entries[2..]);
+        assert_eq!(*projection.rows, project_history_rows(&entries));
+    }
+
+    #[test]
+    fn history_projection_reuses_incremental_cache_until_invalidated() {
+        let user = |uuid: &str, text: &str| {
+            history_entry_from_row(RenderableMessage::user(uuid, text))
+        };
+        let entries = vec![user("u1", "one"), user("u2", "two"), user("u3", "three")];
+        reset_history_projection_rebuild_count();
+
+        let mut projection = HistoryProjection::default();
+        projection.rebuild(&entries[..2]);
+        assert_eq!(history_projection_rebuild_count(), 1);
+
+        projection.append(&entries[2..]);
+        projection.ensure(&entries);
+        assert_eq!(
+            history_projection_rebuild_count(),
+            1,
+            "append + a matching ensure must not reproject the prefix"
+        );
+
+        projection.invalidate();
+        projection.ensure(&entries);
+        assert_eq!(history_projection_rebuild_count(), 2);
     }
 
     /// C3c-4: the seed's dual-carrier prefix and a live turn project back to
@@ -14942,7 +15554,7 @@ mod tests {
     pub(super) struct PluginCompletionObserver {
         pub(super) factory: Arc<std::sync::Mutex<Option<PluginCompletionFactory>>>,
         pub(super) active: Arc<std::sync::Mutex<Option<State<Option<ActiveLocalCommandUi>>>>>,
-        pub(super) history: Arc<std::sync::Mutex<Option<State<Arc<Vec<HistoryEntry>>>>>>,
+        pub(super) history: Arc<std::sync::Mutex<Option<State<HistoryStore>>>>,
     }
 
     #[test]
@@ -15859,6 +16471,7 @@ mod tests {
             messages_memo_key_for_screen(
                 &messages,
                 0,
+                0,
                 false,
                 false,
                 true,
@@ -15870,6 +16483,7 @@ mod tests {
                 None,
                 false,
                 &status_notice_context,
+                None,
                 None,
                 Screen::Prompt,
                 false,

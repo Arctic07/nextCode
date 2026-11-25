@@ -10,7 +10,10 @@
 //! new. Recording at the individual submit sites instead leaves any site that
 //! forgets it silently dropping messages from the JSONL.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use iocraft::prelude::*;
 
@@ -56,6 +59,22 @@ fn plan_record_start(
     (start != len).then_some(start)
 }
 
+/// One render's unrecorded tail. The effect owns this batch instead of the
+/// whole `Arc<Vec<Message>>`: `use_effect` retains its closure until deps
+/// change, so a strong capture would pin the projection model Vec between
+/// frames and force `Arc::make_mut` to deep-clone every message on each
+/// append. Only the messages that still need writing are cloned.
+struct TranscriptBatch {
+    /// Monotonic identity for the effect's dependency array.
+    id: u64,
+    start: usize,
+    len: usize,
+    first_uuid: Option<String>,
+    messages: Vec<Message>,
+}
+
+static NEXT_TRANSCRIPT_BATCH_ID: AtomicU64 = AtomicU64::new(1);
+
 /// Records new conversation messages to the session transcript.
 ///
 /// `ignore` mirrors CC's second argument: while the history is still exactly
@@ -78,29 +97,52 @@ pub fn use_log_messages(hooks: &mut Hooks, messages: Arc<Vec<Message>>, ignore: 
             })
     });
     let mut cursor = hooks.use_ref(LogMessagesCursor::default);
+    // Plan at render time and capture ONLY the unrecorded tail. The effect
+    // re-plans against the current cursor before writing, so a batch that
+    // outlived an earlier effect skips the already-recorded prefix instead of
+    // duplicating it.
+    let first_uuid = messages.first().map(|message| message.uuid().to_string());
+    let len = messages.len();
+    let batch = if ignore {
+        None
+    } else {
+        plan_record_start(&cursor.read(), first_uuid.as_deref(), len).map(|start| TranscriptBatch {
+            id: NEXT_TRANSCRIPT_BATCH_ID.fetch_add(1, Ordering::Relaxed),
+            start,
+            len,
+            first_uuid,
+            messages: messages[start..].to_vec(),
+        })
+    };
     // CC's dependency array is `[messages, ignore, …]` — a new array identity
-    // re-runs the effect. `history_state` publishes a fresh `Arc` per update,
-    // so pointer identity is the same signal.
-    // CC's deps also list the two team fields (`:119`).
+    // re-runs the effect. The batch id serves that role without capturing the
+    // array; CC's deps also list the two team fields (`:119`).
     let deps = (
-        Arc::as_ptr(&messages) as usize,
+        batch.as_ref().map_or(0, |batch| batch.id),
         ignore,
         team_info.clone().unwrap_or_default(),
     );
     hooks.use_effect(
         move || {
-            if ignore {
+            let Some(batch) = batch else {
                 return;
-            }
-            let current_first_uuid = messages.first().map(|message| message.uuid().to_string());
-            // CC :57 — nothing new to write; the cursors stay as they are.
+            };
+            // CC :57 — re-check after render: nothing new means the cursors
+            // stay as they are.
             let Some(start_index) = plan_record_start(
                 &cursor.read(),
-                current_first_uuid.as_deref(),
-                messages.len(),
+                batch.first_uuid.as_deref(),
+                batch.len,
             ) else {
                 return;
             };
+            if start_index < batch.start {
+                // A newer render planned a full-array batch after a head
+                // change; let that effect write instead of this stale tail.
+                return;
+            }
+            let tail_start = start_index - batch.start;
+            let tail = &batch.messages[tail_start..];
 
             // CC :65 — full-array writes rediscover the retained prefix;
             // incremental writes use the previous effect's parent hint.
@@ -109,7 +151,7 @@ pub fn use_log_messages(hooks: &mut Hooks, messages: Arc<Vec<Message>>, ignore: 
                 .flatten();
             let last_parent_uuid =
                 match crate::utils::session_storage::record_typed_messages_with_team(
-                    &messages[start_index..],
+                    tail,
                     team_info.as_ref(),
                     parent_hint.as_deref(),
                 ) {
@@ -124,9 +166,9 @@ pub fn use_log_messages(hooks: &mut Hooks, messages: Arc<Vec<Message>>, ignore: 
 
             // CC :117-118 — unconditional, after the write is dispatched.
             cursor.set(LogMessagesCursor {
-                last_recorded_length: messages.len(),
+                last_recorded_length: batch.len,
                 last_parent_uuid,
-                first_message_uuid: current_first_uuid,
+                first_message_uuid: batch.first_uuid.clone(),
             });
         },
         deps,
@@ -136,6 +178,7 @@ pub fn use_log_messages(hooks: &mut Hooks, messages: Arc<Vec<Message>>, ignore: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     /// What the effect does after a write: CC `useLogMessages.ts:117-118`.
@@ -212,7 +255,7 @@ mod tests {
             }
         });
         let snapshot = messages.read().clone();
-        use_log_messages(&mut hooks, snapshot.clone(), false);
+        use_log_messages(&mut hooks, Arc::clone(&snapshot), false);
         element! { Text(content: format!("len={} head={} tail={}", snapshot.len(), snapshot.first().map(|m| m.uuid()).unwrap_or("empty"), snapshot.last().map(|m| m.uuid()).unwrap_or("empty"))) }
     }
 

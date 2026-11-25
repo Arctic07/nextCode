@@ -95,6 +95,34 @@ pub fn get_preserved_selection(
         .unwrap_or(0)
 }
 
+/// Selection for a suggestion list that was just recomputed.
+///
+/// The two producers of a recompute want different things, and conflating
+/// them made `/init` stay highlighted after the user typed `/new`:
+///
+/// - the user changed the search text (`input_changed`) — the top row of the
+///   new list is the answer to the new query, so carrying the old item by id
+///   would select a command the user never matched. `/init` moved from row 0
+///   to row 1 when `/clear (new)` entered the list, and
+///   [`get_preserved_selection`] faithfully followed it there.
+/// - a producer refreshed results for the SAME query — the user may have
+///   arrowed to a row, and that choice survives the refresh by id.
+///
+/// This is the distinction the source's `onChange → setSelectedSuggestion(0)`
+/// expresses; the Rust recompute runs during render, so the reset travels as
+/// a flag instead of a separate state write.
+pub fn recomputed_selection(
+    previous: &[SuggestionItem],
+    previous_selection: i32,
+    next: &[SuggestionItem],
+    input_changed: bool,
+) -> i32 {
+    if input_changed {
+        return if next.is_empty() { -1 } else { 0 };
+    }
+    get_preserved_selection(previous, previous_selection, next)
+}
+
 /// Maps to: CC `handleAutocompletePrevious` (`useTypeahead.tsx:1715-1723`).
 /// The selector is circular, including the first → last transition. The
 /// source reads `suggestions.length` from its closure; the Rust port takes it
@@ -1403,13 +1431,16 @@ pub struct TypeaheadState {
     pub suggestions: Arc<Vec<SuggestionItem>>,
     pub selected: State<i32>,
     /// Maps to CC `onChange → setSelectedSuggestion(0)`: set it when the
-    /// input text changes and the next suggestion recompute preserves the
-    /// selection from index 0 instead of the current one. A flag rather than
-    /// a write of `selected`: the recompute runs during render and writes
-    /// `selected` only when the preserved index differs, so a keystroke
-    /// whose suggestions stay empty (or keep the same item first) does not
-    /// force the settle pass to re-run the update.
+    /// input text changes and the next suggestion recompute starts at the top
+    /// row. A flag rather than a write of `selected`: the recompute runs during
+    /// render and writes `selected` only when the result differs, so a
+    /// keystroke whose suggestions stay empty does not force the settle pass to
+    /// re-run the update.
     pub selection_reset: Ref<bool>,
+    /// Whether the user arrowed through the current suggestion list. Enter
+    /// honors a deliberate choice; without one it executes the command the
+    /// input actually spells.
+    pub selection_user_moved: Ref<bool>,
     pub has_suggestions: bool,
     /// Maps to CC `maxColumnWidth` state (`useTypeahead.tsx:490`), *not* the
     /// `allCommandsMaxWidth` memo behind it.
@@ -1472,6 +1503,7 @@ pub fn use_typeahead(
     // recompute — a render-phase write that forced a second update pass.
     let previous_suggestions = hooks.use_ref(|| Arc::<Vec<SuggestionItem>>::default());
     let selection_reset = hooks.use_ref(|| false);
+    let selection_user_moved = hooks.use_ref(|| false);
     let file_requests =
         hooks.use_const(|| Arc::new(async_channel::unbounded::<FileSuggestionRequest>()));
     // Monotonic request generation mirrors the source's latestSearchTokenRef:
@@ -1827,12 +1859,23 @@ pub fn use_typeahead(
             let direct_agents = direct_agents.clone();
             let mut previous_suggestions = previous_suggestions;
             let mut selection_reset = selection_reset;
+            let mut selection_user_moved = selection_user_moved;
             move || {
                 // Maps to: CC useTypeahead.tsx:684-688 — suppression clears
                 // suggestions before every consumer, including keybindings.
                 if suppress_suggestions {
                     if selected.get() != -1 {
                         selected.set(-1);
+                    }
+                    // The suppressed list cannot carry either pending
+                    // decision: consuming them here keeps the next visible
+                    // recompute from replaying a stale input edit or a
+                    // selection the user made in a list that is now gone.
+                    if selection_reset.get() {
+                        selection_reset.set(false);
+                    }
+                    if selection_user_moved.get() {
+                        selection_user_moved.set(false);
                     }
                     return Arc::new(Vec::new());
                 }
@@ -1883,15 +1926,19 @@ pub fn use_typeahead(
                 // the same index, so this stays silent on most keystrokes.
                 // CC onChange resets the selection to 0 before
                 // `updateSuggestions` preserves it; the flag carries that
-                // reset here without a state write of its own.
-                let base = if selection_reset.get() {
+                // reset here without a state write of its own. A producer
+                // refresh for the same query keeps the user's chosen row.
+                let input_changed = selection_reset.get();
+                if input_changed {
                     selection_reset.set(false);
-                    0
-                } else {
-                    selected.get()
-                };
-                let preserved =
-                    get_preserved_selection(previous.as_slice(), base, suggestions.as_slice());
+                    selection_user_moved.set(false);
+                }
+                let preserved = recomputed_selection(
+                    previous.as_slice(),
+                    selected.get(),
+                    suggestions.as_slice(),
+                    input_changed,
+                );
                 if preserved != selected.get() {
                     selected.set(preserved);
                 }
@@ -1948,6 +1995,7 @@ pub fn use_typeahead(
         suggestions,
         selected,
         selection_reset,
+        selection_user_moved,
         has_suggestions,
         max_column_width,
         kind,
@@ -2312,6 +2360,28 @@ mod tests {
             commands,
             effective_ghost_text: None,
         }
+    }
+
+    /// Reported flow: `/init` was the recent command, then the user typed
+    /// `/` and `new`. The `/new` query's top row is `/clear (new)`, but
+    /// preserving the previous list's item by id kept `/init` selected, and
+    /// Enter re-ran it. A user edit must start at the top; only a producer
+    /// refresh for the same query may keep the highlighted row.
+    #[test]
+    fn recomputed_selection_distinguishes_input_edit_from_producer_refresh() {
+        let init = command_item("init");
+        let clear = command_item("clear");
+        let previous = vec![init.clone(), clear.clone()];
+        let next = vec![clear, init];
+
+        // Same query, refreshed rows: the old selection stays with its item.
+        assert_eq!(recomputed_selection(&previous, 0, &next, false), 1);
+        // The user typed a new query: the top row wins even though the old
+        // item still exists further down.
+        assert_eq!(recomputed_selection(&previous, 0, &next, true), 0);
+        assert_eq!(recomputed_selection(&previous, 1, &next, false), 0);
+        // No rows for the new query.
+        assert_eq!(recomputed_selection(&previous, 1, &[], true), -1);
     }
 
     #[test]

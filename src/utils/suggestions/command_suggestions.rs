@@ -309,6 +309,43 @@ pub fn command_suggestion_requires_arguments(
     })
 }
 
+/// What Enter should submit when the input itself is a complete slash command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedCommandSubmission {
+    pub input: String,
+    pub requires_arguments: bool,
+}
+
+/// Resolve the typed input as a command invocation, independent of the
+/// suggestion list.
+///
+/// Enter used to execute the selected completion row's `command_text` even
+/// when the user never arrowed through the list. With a stale selection —
+/// `/init` kept highlighted while the input spelled `/new` — that ran a
+/// command the user did not type. The caller consults this first when the
+/// selection is still the automatic top row, so the input wins for an exact
+/// name or alias (`/new` resolves to `/clear`) and for typed arguments.
+/// A fuzzy prefix (`/ini`) does not resolve here and keeps accepting the
+/// highlighted completion.
+pub fn typed_command_submission(
+    input: &str,
+    commands: &[Command],
+) -> Option<TypedCommandSubmission> {
+    let trimmed = input.trim();
+    let parsed = crate::utils::slash_command_parsing::parse_slash_command(trimmed)?;
+    let command = crate::commands::find_command(&parsed.name, commands)?;
+    let requires_arguments = matches!(command.kind, CommandKind::Prompt)
+        && !command.arg_names.is_empty()
+        && parsed.args.trim().is_empty();
+    // Keep the text the user typed, alias included: dispatch resolves it
+    // through the same `find_command`, and the transcript should show the
+    // invocation the user made rather than rewriting it.
+    Some(TypedCommandSubmission {
+        input: trimmed.to_string(),
+        requires_arguments,
+    })
+}
+
 fn is_command_input(input: &str) -> bool {
     input.starts_with('/')
 }
@@ -839,6 +876,65 @@ mod tests {
         command.name = "review".into();
         command.arg_names = vec!["file".into()];
         command
+    }
+
+    /// `/clear` with `/new` as its alias, the pair from the reported flow.
+    fn clear_and_init_commands() -> Vec<Command> {
+        let mut clear = crate::commands::help::command();
+        clear.name = "clear".into();
+        clear.aliases = vec!["new".into()];
+        clear.kind = CommandKind::Local;
+
+        let mut init = crate::commands::help::command();
+        init.name = "init".into();
+        init.kind = CommandKind::Prompt;
+
+        let mut review = prompt_suggestion_command();
+        review.kind = CommandKind::Prompt;
+
+        vec![clear, init, review]
+    }
+
+    #[test]
+    fn typed_alias_submits_the_command_it_resolves_to() {
+        let all = clear_and_init_commands();
+        assert_eq!(
+            typed_command_submission("/new", &all),
+            Some(TypedCommandSubmission {
+                input: "/new".into(),
+                requires_arguments: false,
+            })
+        );
+        // A fuzzy prefix is not a complete invocation: Enter may still accept
+        // the highlighted `/init` row for it.
+        assert_eq!(typed_command_submission("/ini", &all), None);
+    }
+
+    #[test]
+    fn typed_command_keeps_arguments_and_holds_prompt_commands_that_need_them() {
+        let all = clear_and_init_commands();
+        assert_eq!(
+            typed_command_submission("/review", &all),
+            Some(TypedCommandSubmission {
+                input: "/review".into(),
+                requires_arguments: true,
+            })
+        );
+        assert_eq!(
+            typed_command_submission("/review src/lib.rs", &all),
+            Some(TypedCommandSubmission {
+                input: "/review src/lib.rs".into(),
+                requires_arguments: false,
+            })
+        );
+        // `/init` takes no arguments, so a bare invocation executes at once.
+        assert_eq!(
+            typed_command_submission("/init", &all),
+            Some(TypedCommandSubmission {
+                input: "/init".into(),
+                requires_arguments: false,
+            })
+        );
     }
 
     #[test]
